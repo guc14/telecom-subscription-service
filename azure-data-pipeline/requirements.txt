@@ -1,0 +1,4 @@
+azure-identity==1.17.1
+azure-mgmt-storage==21.1.0
+azure-mgmt-datafactory==6.0.0
+azure-storage-blob==12.19.1
