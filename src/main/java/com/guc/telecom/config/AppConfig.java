@@ -8,12 +8,13 @@ import org.springframework.web.client.RestTemplate;
 public class AppConfig {
 
     /**
-     * RestTemplate bean — used by AiDescriptionService for OpenAI calls
-     * and by AdvisorService for Python sidecar calls.
+     * RestTemplate bean — used by AdvisorService for HTTP calls to the
+     * Python FastAPI sidecar (POST /api/v1/advise).
      *
-     * Declared here once so both services receive the same managed instance
-     * rather than constructing their own (which bypasses Spring's proxy chain
-     * and makes mocking in tests harder).
+     * Note: AiDescriptionService previously used RestTemplate to call the
+     * OpenAI API directly. That has been replaced by Spring AI's ChatClient,
+     * which is auto-configured by Spring AI and does not require a RestTemplate.
+     * RestTemplate is retained here solely for the sidecar integration.
      */
     @Bean
     public RestTemplate restTemplate() {

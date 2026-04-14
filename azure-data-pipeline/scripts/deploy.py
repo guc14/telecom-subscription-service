@@ -1,18 +1,5 @@
 """
-deploy.py — One-shot Azure infrastructure setup for the Telecom Data Pipeline.
-
-What this script does:
-  1. Creates an Azure Storage Account + Blob container
-  2. Uploads subscriptions.csv to Blob Storage
-  3. Creates an Azure Data Factory instance
-  4. Creates a pipeline: Blob Storage → Blob Storage (CSV copy, simulating MySQL export)
-
-Prerequisites:
-  pip install azure-identity azure-mgmt-storage azure-mgmt-datafactory azure-storage-blob
-
-Usage:
-  export AZURE_SUBSCRIPTION_ID=d4dd2968-d53c-497d-b767-e6c95be4326d
-  python deploy.py
+deploy.py — Telecom Azure Data Pipeline Setup
 """
 
 import os
@@ -22,161 +9,134 @@ from azure.mgmt.storage import StorageManagementClient
 from azure.mgmt.datafactory import DataFactoryManagementClient
 from azure.mgmt.datafactory.models import (
     Factory,
-    LinkedService,
+    LinkedServiceResource,
     AzureBlobStorageLinkedService,
-    AzureBlobStorageLinkedServiceTypeProperties,
     DatasetResource,
-    DelimitedTextDataset,
-    DatasetReference,
+    AzureBlobDataset,
+    TextFormat,
+    LinkedServiceReference,
     PipelineResource,
     CopyActivity,
-    ActivityDependency,
+    DatasetReference,
     BlobSource,
     BlobSink,
-    DelimitedTextReadSettings,
-    DelimitedTextWriteSettings,
-    AzureBlobDataset,
-    LinkedServiceReference,
 )
 from azure.storage.blob import BlobServiceClient
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-SUBSCRIPTION_ID   = os.environ.get("AZURE_SUBSCRIPTION_ID", "d4dd2968-d53c-497d-b767-e6c95be4326d")
-RESOURCE_GROUP    = "telecom-rg"
-LOCATION          = "canadaeast"
-STORAGE_ACCOUNT   = "telecomstorage001"   # must be globally unique, lowercase, 3-24 chars
-CONTAINER_NAME    = "subscription-data"
-ADF_NAME          = "telecom-adf"
-PIPELINE_NAME     = "CopySubscriptionData"
-LOCAL_CSV         = os.path.join(os.path.dirname(__file__), "..", "data", "subscriptions.csv")
+SUBSCRIPTION_ID = "d4dd2968-d53c-497d-b767-e6c95be4326d"
+RESOURCE_GROUP  = "telecom-rg"
+LOCATION        = "canadaeast"
+STORAGE_ACCOUNT = "telecomstore001guc"
+CONTAINER_NAME  = "subscription-data"
+ADF_NAME        = "telecom-adf-001"
+PIPELINE_NAME   = "CopySubscriptionData"
+LOCAL_CSV       = os.path.join(os.path.dirname(__file__), "..", "data", "subscriptions.csv")
 
 print("=== Telecom Azure Data Pipeline Setup ===\n")
-
 credential = DefaultAzureCredential()
 
-# ── Step 1: Create Storage Account ───────────────────────────────────────────
+# Step 1: Storage Account
 print("[1/5] Creating Storage Account...")
 storage_client = StorageManagementClient(credential, SUBSCRIPTION_ID)
-
-storage_async = storage_client.storage_accounts.begin_create(
-    RESOURCE_GROUP,
-    STORAGE_ACCOUNT,
-    {
-        "location": LOCATION,
-        "kind": "StorageV2",
-        "sku": {"name": "Standard_LRS"},
-    }
-)
-storage_account = storage_async.result()
-print(f"     Storage Account created: {storage_account.name}")
-
-# Get connection string
-keys = storage_client.storage_accounts.list_keys(RESOURCE_GROUP, STORAGE_ACCOUNT)
-conn_str = (
-    f"DefaultEndpointsProtocol=https;"
-    f"AccountName={STORAGE_ACCOUNT};"
-    f"AccountKey={keys.keys[0].value};"
-    f"EndpointSuffix=core.windows.net"
-)
-
-# ── Step 2: Create Blob Container and Upload CSV ──────────────────────────────
-print("[2/5] Creating Blob container and uploading subscriptions.csv...")
-blob_service = BlobServiceClient.from_connection_string(conn_str)
-container = blob_service.get_container_client(CONTAINER_NAME)
-
 try:
-    container.create_container()
+    op = storage_client.storage_accounts.begin_create(
+        RESOURCE_GROUP, STORAGE_ACCOUNT,
+        {"location": LOCATION, "kind": "StorageV2", "sku": {"name": "Standard_LRS"}}
+    )
+    op.result()
 except Exception:
     pass  # already exists
+print(f"      Done: {STORAGE_ACCOUNT}")
 
-with open(LOCAL_CSV, "rb") as f:
-    container.upload_blob("raw/subscriptions.csv", f, overwrite=True)
-
-print(f"     Uploaded subscriptions.csv → {CONTAINER_NAME}/raw/subscriptions.csv")
-
-# ── Step 3: Create Azure Data Factory ────────────────────────────────────────
-print("[3/5] Creating Azure Data Factory...")
-adf_client = DataFactoryManagementClient(credential, SUBSCRIPTION_ID)
-
-adf = adf_client.factories.create_or_update(
-    RESOURCE_GROUP,
-    ADF_NAME,
-    Factory(location=LOCATION)
+keys = storage_client.storage_accounts.list_keys(RESOURCE_GROUP, STORAGE_ACCOUNT)
+account_key = keys.keys[0].value
+conn_str = (
+    f"DefaultEndpointsProtocol=https;AccountName={STORAGE_ACCOUNT};"
+    f"AccountKey={account_key};EndpointSuffix=core.windows.net"
 )
-print(f"     ADF created: {adf.name}")
 
-# Wait for ADF to be ready
-time.sleep(10)
+# Step 2: Upload CSV
+print("[2/5] Uploading subscriptions.csv...")
+blob_svc = BlobServiceClient.from_connection_string(conn_str)
+try:
+    blob_svc.create_container(CONTAINER_NAME)
+except Exception:
+    pass
+with open(LOCAL_CSV, "rb") as f:
+    blob_svc.get_blob_client(CONTAINER_NAME, "raw/subscriptions.csv").upload_blob(f, overwrite=True)
+print(f"      Uploaded → {CONTAINER_NAME}/raw/subscriptions.csv")
 
-# ── Step 4: Create Linked Service (Blob Storage connection) ───────────────────
+# Step 3: Data Factory
+print("[3/5] Creating Azure Data Factory...")
+adf = DataFactoryManagementClient(credential, SUBSCRIPTION_ID)
+try:
+    adf.factories.create_or_update(RESOURCE_GROUP, ADF_NAME, Factory(location=LOCATION))
+except Exception:
+    pass
+print(f"      Done: {ADF_NAME}")
+time.sleep(15)
+
+# Step 4: Linked Service + Datasets
 print("[4/5] Creating Linked Service and Datasets...")
-linked_service_name = "TelecomBlobStorage"
+LS_NAME = "BlobStorageLS"
 
-adf_client.linked_services.create_or_update(
-    RESOURCE_GROUP,
-    ADF_NAME,
-    linked_service_name,
-    LinkedService(
-        properties=AzureBlobStorageLinkedService(
-            connection_string=conn_str
-        )
+adf.linked_services.create_or_update(
+    RESOURCE_GROUP, ADF_NAME, LS_NAME,
+    LinkedServiceResource(
+        properties=AzureBlobStorageLinkedService(connection_string=conn_str)
     )
 )
 
-# Source dataset (raw CSV)
-adf_client.datasets.create_or_update(
-    RESOURCE_GROUP,
-    ADF_NAME,
-    "SubscriptionRawCSV",
+ls_ref = LinkedServiceReference(
+    reference_name=LS_NAME,
+    type="LinkedServiceReference"
+)
+
+adf.datasets.create_or_update(
+    RESOURCE_GROUP, ADF_NAME, "SourceCSV",
     DatasetResource(
         properties=AzureBlobDataset(
-            linked_service_name=LinkedServiceReference(reference_name=linked_service_name),
+            linked_service_name=ls_ref,
             folder_path=f"{CONTAINER_NAME}/raw",
             file_name="subscriptions.csv",
-            format={"type": "TextFormat", "columnDelimiter": ",", "firstRowAsHeader": True}
+            format=TextFormat(column_delimiter=",", first_row_as_header=True)
         )
     )
 )
 
-# Sink dataset (processed CSV)
-adf_client.datasets.create_or_update(
-    RESOURCE_GROUP,
-    ADF_NAME,
-    "SubscriptionProcessedCSV",
+adf.datasets.create_or_update(
+    RESOURCE_GROUP, ADF_NAME, "SinkCSV",
     DatasetResource(
         properties=AzureBlobDataset(
-            linked_service_name=LinkedServiceReference(reference_name=linked_service_name),
+            linked_service_name=ls_ref,
             folder_path=f"{CONTAINER_NAME}/processed",
             file_name="subscriptions_processed.csv",
-            format={"type": "TextFormat", "columnDelimiter": ",", "firstRowAsHeader": True}
+            format=TextFormat(column_delimiter=",", first_row_as_header=True)
         )
     )
 )
 
-# ── Step 5: Create Pipeline ───────────────────────────────────────────────────
-print("[5/5] Creating Data Factory Pipeline...")
+# Step 5: Pipeline
+print("[5/5] Creating and running pipeline...")
 
-copy_activity = CopyActivity(
-    name="CopySubscriptionCSV",
-    inputs=[DatasetReference(reference_name="SubscriptionRawCSV")],
-    outputs=[DatasetReference(reference_name="SubscriptionProcessedCSV")],
-    source=BlobSource(),
-    sink=BlobSink()
+adf.pipelines.create_or_update(
+    RESOURCE_GROUP, ADF_NAME, PIPELINE_NAME,
+    PipelineResource(
+        activities=[
+            CopyActivity(
+                name="CopyCSV",
+                inputs=[DatasetReference(reference_name="SourceCSV", type="DatasetReference")],
+                outputs=[DatasetReference(reference_name="SinkCSV", type="DatasetReference")],
+                source=BlobSource(),
+                sink=BlobSink(),
+            )
+        ]
+    )
 )
 
-adf_client.pipelines.create_or_update(
-    RESOURCE_GROUP,
-    ADF_NAME,
-    PIPELINE_NAME,
-    PipelineResource(activities=[copy_activity])
-)
-
-# Trigger pipeline run
-run = adf_client.pipelines.create_run(RESOURCE_GROUP, ADF_NAME, PIPELINE_NAME)
-print(f"     Pipeline triggered! Run ID: {run.run_id}")
+run = adf.pipelines.create_run(RESOURCE_GROUP, ADF_NAME, PIPELINE_NAME)
+print(f"      Pipeline triggered! Run ID: {run.run_id}")
 
 print("\n=== Setup Complete ===")
-print(f"Storage Account : https://portal.azure.com → {STORAGE_ACCOUNT}")
-print(f"Data Factory    : https://adf.azure.com")
-print(f"Pipeline        : {PIPELINE_NAME}")
-print(f"\nNext step: Open notebooks/subscription_analysis.ipynb in Databricks")
+print(f"Storage : portal.azure.com → Storage accounts → {STORAGE_ACCOUNT}")
+print(f"ADF     : adf.azure.com → {ADF_NAME}")

@@ -5,9 +5,16 @@ import com.guc.telecom.dto.CreateCustomerRequest;
 import com.guc.telecom.dto.CreateServicePlanRequest;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.http.MediaType;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.annotation.DirtiesContext;
@@ -16,7 +23,6 @@ import org.springframework.test.web.servlet.MockMvc;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
-import static org.hamcrest.Matchers.*;
 
 /**
  * Integration tests for subscription activation.
@@ -25,21 +31,26 @@ import static org.hamcrest.Matchers.*;
  *   - @SpringBootTest: full application context (H2 in-memory DB)
  *   - @EmbeddedKafka: real Kafka broker in-process, no external Kafka needed
  *   - @AutoConfigureMockMvc: real HTTP layer via MockMvc
+ *   - MockRedisConfig: replaces StringRedisTemplate with a Mockito mock so that
+ *     idempotency checks in SubscriptionService don't require a real Redis server.
+ *     (spring.cache.type=none in application-test.properties already handles
+ *     @Cacheable, but StringRedisTemplate is injected directly and needs mocking.)
  *
  * Tests verify the complete flow:
  *   HTTP request → Controller → Service → DB → Redis (mocked) → Kafka (embedded)
  *
  * Coverage:
  *   - Successful activation → 200
- *   - Idempotency: same X-Idempotency-Key → 200 (no error, no duplicate)
  *   - Duplicate subscription → 409 DUPLICATE_SUBSCRIPTION
  *   - Plan capacity exceeded → 409 PLAN_CAPACITY_EXCEEDED
  *   - Customer not found → 404
  *   - Plan not found → 404
+ *   - Customer CRUD lifecycle
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+@Import(SubscriptionControllerIntegrationTest.MockRedisConfig.class)
 @EmbeddedKafka(
     partitions = 1,
     topics = {"subscription.activated"},
@@ -47,6 +58,38 @@ import static org.hamcrest.Matchers.*;
 )
 @DirtiesContext
 class SubscriptionControllerIntegrationTest {
+
+    // ── Mock Redis — replaces StringRedisTemplate bean so no real Redis needed ──
+
+    @TestConfiguration
+    static class MockRedisConfig {
+
+        /**
+         * Provides a mock StringRedisTemplate as the primary bean.
+         *
+         * Default behaviour:
+         *   - hasKey() returns false  → idempotency check passes (no duplicate hit)
+         *   - opsForValue().set() is a no-op → idempotency key storage is skipped
+         *
+         * This matches the happy-path contract: first call always proceeds,
+         * subsequent duplicate-subscription checks are caught at the DB level
+         * (SubscriptionRepository unique constraint), not at the Redis level.
+         */
+        @Bean
+        @Primary
+        @SuppressWarnings("unchecked")
+        StringRedisTemplate stringRedisTemplate() {
+            StringRedisTemplate mock = Mockito.mock(StringRedisTemplate.class);
+            // Idempotency fast-path: treat every key as "not yet seen"
+            Mockito.when(mock.hasKey(Mockito.anyString())).thenReturn(false);
+            // Stub opsForValue() so the set() call after successful activation is a no-op
+            ValueOperations<String, String> valueOps = Mockito.mock(ValueOperations.class);
+            Mockito.when(mock.opsForValue()).thenReturn(valueOps);
+            return mock;
+        }
+    }
+
+    // ── Test wiring ───────────────────────────────────────────────────────────
 
     @Autowired MockMvc mockMvc;
     @Autowired ObjectMapper objectMapper;

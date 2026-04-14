@@ -1,5 +1,6 @@
 package com.guc.telecom.config;
 
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -23,12 +24,20 @@ import java.time.Duration;
  * TTL: 10 minutes for customer cache entries.
  *   Short enough to reflect updates (name/age changes after PUT).
  *   Long enough to absorb repeated reads during high-traffic subscription bursts.
+ *
+ * Why @ConditionalOnProperty on the @Bean (not the class):
+ *   When spring.cache.type=none (test profile), Spring Boot's auto-configuration
+ *   provides a no-op CacheManager. But if we manually declare a RedisCacheManager
+ *   bean, it overrides that no-op — forcing a real Redis connection even in tests.
+ *   Guarding the @Bean with this condition prevents the override, so
+ *   spring.cache.type=none actually works as intended in CI/test environments.
  */
 @EnableCaching
 @Configuration
 public class RedisConfig {
 
     @Bean
+    @ConditionalOnProperty(name = "spring.cache.type", havingValue = "redis", matchIfMissing = true)
     public RedisCacheManager cacheManager(RedisConnectionFactory connectionFactory) {
         RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig()
             // Human-readable string keys: "customers::42"

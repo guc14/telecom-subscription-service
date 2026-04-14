@@ -2,93 +2,83 @@ package com.guc.telecom.service;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.*;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
-
-import java.util.List;
-import java.util.Map;
 
 /**
- * AiDescriptionService — calls OpenAI Chat Completions API to auto-generate
- * a concise service plan description when none is provided at creation time.
+ * AiDescriptionService — uses Spring AI ChatClient to auto-generate a concise
+ * service plan description when none is provided at creation time.
  *
- * Design principle — Non-blocking fallback:
- *   This is a non-critical enrichment. If the API call fails for any reason
+ * Why Spring AI instead of raw RestTemplate:
+ *   The previous implementation manually constructed HTTP headers, serialized
+ *   the request body as a Map, and cast the response through unchecked generics.
+ *   Spring AI's ChatClient eliminates all of that boilerplate and provides:
+ *     - Provider portability: swap OpenAI → Azure OpenAI → Ollama via config only
+ *     - Built-in retry and error handling (configured in application.properties)
+ *     - SimpleLoggerAdvisor: logs prompt + response token usage automatically
+ *     - Type-safe fluent API: no unchecked casts, no raw Map parsing
+ *
+ * Design principle — Non-blocking fallback (unchanged from previous version):
+ *   This is a non-critical enrichment. If the call fails for any reason
  *   (network error, timeout, quota exceeded, missing key), the method catches
  *   the exception, logs a warning, and returns null. The caller (ServicePlanService)
  *   treats null as "no description" and saves the plan without one.
  *   The core subscription flow is never blocked by an external AI service failure.
- *
- * This is the same pattern used for any non-critical third-party integration:
- * welcome email after registration, SMS notification after order — the core
- * transaction commits first, enrichment is best-effort.
  */
 @Service
 public class AiDescriptionService {
 
     private static final Logger logger = LoggerFactory.getLogger(AiDescriptionService.class);
-    private static final String OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
-    @Value("${openai.api.key:}")
-    private String apiKey;
+    // System prompt: defines the LLM's persona and output format.
+    // Kept as a constant so it's easy to tune without touching business logic.
+    private static final String SYSTEM_PROMPT =
+            "You are a telecom product marketing assistant. " +
+            "Write concise, professional service plan descriptions in 2-3 sentences. " +
+            "Focus on key benefits: speed, coverage, and value for money.";
 
-    private final RestTemplate restTemplate;
+    private final ChatClient chatClient;
 
-    public AiDescriptionService(RestTemplate restTemplate) {
-        this.restTemplate = restTemplate;
+    /**
+     * ChatClient is auto-configured by Spring AI when spring.ai.openai.api-key
+     * is present in application.properties. The builder is injected by Spring.
+     *
+     * SimpleLoggerAdvisor logs the full prompt and response at DEBUG level —
+     * useful for inspecting token usage and prompt quality during development.
+     */
+    public AiDescriptionService(ChatClient.Builder chatClientBuilder) {
+        this.chatClient = chatClientBuilder
+                .defaultSystem(SYSTEM_PROMPT)
+                // Logs prompt + response + token usage at DEBUG level
+                .defaultAdvisors(new SimpleLoggerAdvisor())
+                .build();
     }
 
     /**
-     * Generates a marketing description for a telecom service plan using GPT.
+     * Generates a marketing description for a telecom service plan using
+     * Spring AI's ChatClient (backed by OpenAI GPT-4o-mini by default).
+     *
+     * Provider can be switched to Azure OpenAI or Ollama via config:
+     *   spring.ai.openai.api-key       → OpenAI (default)
+     *   spring.ai.azure.openai.*       → Azure OpenAI (enterprise / data residency)
+     *   spring.ai.ollama.*             → Ollama local model (zero cost, air-gapped)
      *
      * @param planName  the name of the plan (e.g. "5G Unlimited Plus")
      * @return          a 2-3 sentence description, or null if the call fails
      */
     public String generateDescription(String planName) {
-        if (apiKey == null || apiKey.isBlank()) {
-            logger.warn("OpenAI API key not configured — skipping AI description generation");
-            return null;
-        }
-
         try {
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            headers.setBearerAuth(apiKey);
+            String description = chatClient.prompt()
+                    .user("Write a product description for this telecom service plan: " + planName)
+                    .call()
+                    .content();
 
-            Map<String, Object> body = Map.of(
-                "model", "gpt-4o-mini",
-                "max_tokens", 120,
-                "messages", List.of(
-                    Map.of("role", "system",
-                           "content", "You are a telecom product marketing assistant. " +
-                                      "Write concise, professional service plan descriptions in 2-3 sentences."),
-                    Map.of("role", "user",
-                           "content", "Write a product description for this telecom service plan: " + planName)
-                )
-            );
-
-            @SuppressWarnings("unchecked")
-            ResponseEntity<Map<String, Object>> response = restTemplate.postForEntity(
-                OPENAI_URL,
-                new HttpEntity<>(body, headers),
-                (Class<Map<String, Object>>) (Class<?>) Map.class
-            );
-
-            Map<String, Object> responseBody = response.getBody();
-            if (responseBody == null) return null;
-
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> choices = (List<Map<String, Object>>) responseBody.get("choices");
-            if (choices == null || choices.isEmpty()) return null;
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> message = (Map<String, Object>) choices.get(0).get("message");
-            String content = (String) message.get("content");
-            return content != null ? content.trim() : null;
+            logger.info("Generated AI description for plan '{}'", planName);
+            return description != null ? description.trim() : null;
 
         } catch (Exception ex) {
+            // Non-critical: log and return null — caller saves plan without description
             logger.warn("AI description generation failed for plan '{}': {}", planName, ex.getMessage());
             return null;
         }

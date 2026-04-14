@@ -146,7 +146,7 @@ class TelecomAdvisorAgent:
         )
 
         user_message = (
-            f"Customer: {request.customer_name} (ID: {request.customer_id}, Age: {request.age})\n"
+            f"Customer: {request.customerName} (ID: {request.customerId}, Age: {request.age})\n"
             f"Question: {request.question}"
         )
 
@@ -191,8 +191,8 @@ class TelecomAdvisorAgent:
                 recommended = _parse_recommended_plans(advice_text)
 
                 return AdvisorResponse(
-                    customer_id=request.customer_id,
-                    customer_name=request.customer_name,
+                    customer_id=request.customerId,
+                    customer_name=request.customerName,
                     advice=advice_text,
                     recommended_plans=recommended,
                     agent_steps=steps,
@@ -202,8 +202,8 @@ class TelecomAdvisorAgent:
             break
 
         return AdvisorResponse(
-            customer_id=request.customer_id,
-            customer_name=request.customer_name,
+            customer_id=request.customerId,
+            customer_name=request.customerName,
             advice="Unable to generate recommendation at this time. Please try again.",
             recommended_plans=[],
             agent_steps=steps,
