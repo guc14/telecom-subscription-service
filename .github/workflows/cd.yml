@@ -6,7 +6,7 @@
 #   2. deploy-azure    → update Azure Container Instance via Azure CLI
 #
 # Required GitHub Secrets (set in repo → Settings → Secrets):
-#   DOCKERHUB_USERNAME     e.g. guc14
+#   DOCKERHUB_USERNAME     e.g. chengujuli
 #   DOCKERHUB_TOKEN        Docker Hub access token (not password)
 #   AZURE_CREDENTIALS      JSON output of: az ad sp create-for-rbac ...
 #   OPENAI_API_KEY         passed into container at runtime
@@ -21,9 +21,9 @@ on:
 
 # ── Shared env vars (used across jobs) ───────────────────────
 env:
-  # Docker Hub image names — change guc14 to your actual DockerHub username
-  JAVA_IMAGE: guc14/telecom-subscription-service
-  SIDECAR_IMAGE: guc14/telecom-ai-sidecar
+  # Docker Hub image names — change chengujuli to your actual DockerHub username
+  JAVA_IMAGE: chengujuli/telecom-subscription-service
+  SIDECAR_IMAGE: chengujuli/telecom-ai-sidecar
 
   # Azure config — matches your existing telecom-rg (Canada East)
   AZURE_RESOURCE_GROUP: telecom-rg
@@ -48,8 +48,8 @@ jobs:
         uses: actions/checkout@v4
 
       # Generate image tag from Git SHA (short, 7 chars)
-      # e.g.  guc14/telecom-subscription-service:a1b2c3d
-      #       guc14/telecom-subscription-service:latest
+      # e.g.  chengujuli/telecom-subscription-service:a1b2c3d
+      #       chengujuli/telecom-subscription-service:latest
       - name: Generate image metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@v5
