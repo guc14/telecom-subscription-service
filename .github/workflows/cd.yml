@@ -1,0 +1,169 @@
+# ============================================================
+# CD Workflow — Telecom Subscription Service
+# Trigger: push to main branch ONLY (i.e., after PR merge)
+# Jobs:
+#   1. build-and-push  → build Docker images, push to Docker Hub
+#   2. deploy-azure    → update Azure Container Instance via Azure CLI
+#
+# Required GitHub Secrets (set in repo → Settings → Secrets):
+#   DOCKERHUB_USERNAME     e.g. guc14
+#   DOCKERHUB_TOKEN        Docker Hub access token (not password)
+#   AZURE_CREDENTIALS      JSON output of: az ad sp create-for-rbac ...
+#   OPENAI_API_KEY         passed into container at runtime
+# ============================================================
+
+name: CD – Build, Push & Deploy
+
+# ── When to run ─────────────────────────────────────────────
+on:
+  push:
+    branches: [main]    # only deploy when code lands on main
+
+# ── Shared env vars (used across jobs) ───────────────────────
+env:
+  # Docker Hub image names — change guc14 to your actual DockerHub username
+  JAVA_IMAGE: guc14/telecom-subscription-service
+  SIDECAR_IMAGE: guc14/telecom-ai-sidecar
+
+  # Azure config — matches your existing telecom-rg (Canada East)
+  AZURE_RESOURCE_GROUP: telecom-rg
+  AZURE_CONTAINER_GROUP: telecom-aci-group   # Azure Container Instance group name
+  AZURE_LOCATION: canadaeast
+
+# ── Jobs ────────────────────────────────────────────────────
+jobs:
+
+  # ── Job 1: Build & Push Docker Images ─────────────────────
+  build-and-push:
+    name: Build & Push to Docker Hub
+    runs-on: ubuntu-latest
+
+    # Expose image tag as output so job 2 can reference it
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Generate image tag from Git SHA (short, 7 chars)
+      # e.g.  guc14/telecom-subscription-service:a1b2c3d
+      #       guc14/telecom-subscription-service:latest
+      - name: Generate image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.JAVA_IMAGE }}
+            ${{ env.SIDECAR_IMAGE }}
+          tags: |
+            type=sha,prefix=,format=short   # short Git SHA tag
+            type=raw,value=latest           # always update :latest
+
+      # Log in to Docker Hub using secrets stored in GitHub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          # DOCKERHUB_TOKEN: generate at hub.docker.com → Account Settings → Security
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Set up Docker Buildx (multi-platform builder, also enables layer caching)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the Java Spring Boot image and push to Docker Hub
+      - name: Build & push Java service image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true            # CD workflow: push to registry
+          tags: |
+            ${{ env.JAVA_IMAGE }}:${{ steps.meta.outputs.version }}
+            ${{ env.JAVA_IMAGE }}:latest
+          cache-from: type=gha  # GitHub Actions cache (speeds up builds ~50%)
+          cache-to: type=gha,mode=max
+
+      # Build the Python FastAPI sidecar image and push
+      - name: Build & push Python sidecar image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ai-advisor-sidecar
+          file: ./ai-advisor-sidecar/Dockerfile
+          push: true
+          tags: |
+            ${{ env.SIDECAR_IMAGE }}:${{ steps.meta.outputs.version }}
+            ${{ env.SIDECAR_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Job 2: Deploy to Azure Container Instance ─────────────
+  deploy-azure:
+    name: Deploy to Azure (Canada East)
+    runs-on: ubuntu-latest
+    needs: build-and-push    # wait for images to be pushed first
+    environment: production  # optional: adds manual approval gate in GitHub UI
+
+    steps:
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Authenticate with Azure using a Service Principal
+      # To generate AZURE_CREDENTIALS secret, run in Azure CLI:
+      #   az ad sp create-for-rbac \
+      #     --name "github-actions-telecom" \
+      #     --role contributor \
+      #     --scopes /subscriptions/<SUB_ID>/resourceGroups/telecom-rg \
+      #     --sdk-auth
+      # Copy the entire JSON output → paste as AZURE_CREDENTIALS secret
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Deploy or update Azure Container Instance group
+      # This runs `az container create` which:
+      #   - creates the container group if it doesn't exist
+      #   - replaces (redeploys) it if it already exists
+      - name: Deploy to Azure Container Instance
+        uses: azure/cli@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az container create \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --name ${{ env.AZURE_CONTAINER_GROUP }} \
+              --location ${{ env.AZURE_LOCATION }} \
+              --image ${{ env.JAVA_IMAGE }}:latest \
+              --cpu 1 \
+              --memory 1.5 \
+              --ports 8080 \
+              --dns-name-label telecom-api \
+              --environment-variables \
+                SPRING_PROFILES_ACTIVE=docker \
+                AI_ADVISOR_URL=http://localhost:8000 \
+                SPRING_JPA_HIBERNATE_DDL_AUTO=update \
+              --secure-environment-variables \
+                OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} \
+                SPRING_DATASOURCE_URL=${{ secrets.DB_URL }} \
+                SPRING_DATASOURCE_USERNAME=${{ secrets.DB_USERNAME }} \
+                SPRING_DATASOURCE_PASSWORD=${{ secrets.DB_PASSWORD }} \
+                SPRING_DATA_REDIS_HOST=${{ secrets.REDIS_HOST }} \
+                SPRING_KAFKA_BOOTSTRAP_SERVERS=${{ secrets.KAFKA_BROKERS }}
+
+      # Print the public FQDN of the deployed container
+      - name: Print deployed URL
+        uses: azure/cli@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            FQDN=$(az container show \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --name ${{ env.AZURE_CONTAINER_GROUP }} \
+              --query ipAddress.fqdn \
+              --output tsv)
+            echo "✅ Deployed: http://${FQDN}:8080"
+            echo "📋 Swagger:  http://${FQDN}:8080/swagger-ui/index.html"

@@ -11,23 +11,15 @@ import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Component;
 
 /**
- * SubscriptionNotificationConsumer — consumes SubscriptionActivatedEvents
- * and triggers downstream notification workflows.
+ * Kafka consumer for subscription activation events.
  *
- * In a real telecom system this consumer would:
- *   - Send a welcome SMS via Twilio / Telus SMS gateway
- *   - Send a confirmation email via SendGrid
- *   - POST to the CRM API to update the customer's active plan
- *   - Write an immutable audit log entry
- *   - Trigger the billing cycle creation in the billing microservice
+ * Responsibilities:
+ * - Trigger customer notification workflow
+ * - Simulate downstream CRM / billing integration
+ * - Consume events asynchronously from Kafka
  *
- * For this portfolio project, we simulate these actions with structured logging.
- * The log output demonstrates the event payload is correctly deserialised
- * and consumed — verifiable in tests via EmbeddedKafka.
- *
- * Consumer group: telecom-notification-group
- *   All instances of this service share the group, so each event is processed
- *   by exactly one instance (load balanced across partitions).
+ * Consumer Group:
+ * telecom-notification-group
  */
 @Component
 public class SubscriptionNotificationConsumer {
