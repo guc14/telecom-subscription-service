@@ -21,3 +21,7 @@ langchain-openai==0.2.11
 
 # ── Week 2: MySQL connector for observability ──────────────────────────────────
 mysql-connector-python==9.1.0
+# ── Upgrade 1: RAG Pipeline ──────────────────────────────────────────────────
+chromadb==0.5.23
+langchain-chroma==0.1.4
+tiktoken==0.8.0

@@ -20,7 +20,7 @@ services:
       MYSQL_USER: telecom
       MYSQL_PASSWORD: telecom123
     ports:
-      - "3306:3306"
+      - "3307:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -111,8 +111,16 @@ services:
       JAVA_SERVICE_URL: http://java-service:8080
       HOST: 0.0.0.0
       PORT: 8000
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: telecom
+      MYSQL_PASSWORD: telecom123
+      MYSQL_DATABASE: telecomdb
     depends_on:
       - java-service
+    volumes:
+      - chroma-data:/app/chroma_db
 
 volumes:
   mysql-data:
+  chroma-data:

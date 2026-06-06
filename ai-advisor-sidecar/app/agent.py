@@ -1,23 +1,13 @@
 """
 agent.py — LangGraph-based Telecom Plan Advisor Agent
 ======================================================
-Upgrades the original hand-written while-loop to a proper LangGraph StateGraph.
+Graph topology (Week 1 + Week 2 + Upgrade 1 RAG combined):
+    call_model → (conditional) → tools → call_model → ...
+                               ↘ END
 
-Graph topology (Week 1 + Week 2 combined):
-    intake → tool_node → respond
-               ↑___________↓  (loop back if more tools needed)
-
-Week 1 additions vs original:
-  - StateGraph with typed AgentState (replaces manual messages list)
-  - ToolNode (LangGraph built-in, replaces manual _execute_tool dispatch)
-  - MemorySaver checkpointer → multi-turn conversation memory per session
-
-Week 2 additions:
-  - _record_metrics() → writes token usage + latency to MySQL ai_call_log table
-  - Every LLM call records: session_id, input_tokens, output_tokens, latency_ms
-
-Language: Python 3.11+
-Key libraries: langgraph, langchain-openai, langchain-core
+Week 1: StateGraph, ToolNode, MemorySaver
+Week 2: _record_metrics() → MySQL ai_call_log
+Upgrade 1: retrieve_plan_context tool → ChromaDB RAG pipeline
 """
 
 import json
@@ -25,39 +15,34 @@ import time
 import logging
 from typing import Annotated, Optional
 
-# ── LangGraph imports ──────────────────────────────────────────────────────────
-# langgraph: the graph orchestration library
-# StateGraph: the main class for building a node-based agent graph
-# END: a sentinel value meaning "stop the graph here"
-# MemorySaver: an in-memory checkpointer that saves conversation state between turns
 from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages   # reducer: appends new msgs to state
-from langgraph.prebuilt import ToolNode            # built-in node that executes tool calls
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
-# ── LangChain imports ──────────────────────────────────────────────────────────
-# ChatOpenAI: LangChain wrapper around OpenAI chat completions
-# bind_tools: attaches tool schemas to the model so it can emit tool_calls
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.tools import tool
 
-# ── typing_extensions ──────────────────────────────────────────────────────────
-# TypedDict: defines the shape of the graph state (like a typed dict / dataclass)
 from typing_extensions import TypedDict
 
 from app.models import AdvisorRequest, AdvisorResponse, PlanInfo, SubscriptionInfo
 from app.registry_client import RegistryClient, RegistryClientError
 from app.config import settings
 
+# ── Upgrade 1: RAG module ─────────────────────────────────────────────────────
+# rag.retrieve(query): loads ChromaDB, embeds query, returns top-3 similar plans
+from app import rag
+
 # ── Database imports for observability (Week 2) ────────────────────────────────
 import mysql.connector
+
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 # ── MemorySaver: module-level singleton ────────────────────────────────────────
-# Why module-level: one MemorySaver shared across all requests so that
-# conversation history persists between API calls for the same session_id.
+# One MemorySaver shared across all requests.
 # Each session_id gets its own isolated memory thread.
 memory = MemorySaver()
 
@@ -70,8 +55,8 @@ class AgentState(TypedDict):
     """
     The state that flows through every node in the graph.
 
-    messages: list of LangChain message objects (HumanMessage, AIMessage, ToolMessage)
-              Annotated[..., add_messages] means: when updating, APPEND don't replace.
+    messages:    list of LangChain message objects (HumanMessage, AIMessage, ToolMessage)
+                 Annotated[..., add_messages] means: when updating, APPEND don't replace.
     customer_id: carried through state so tool functions can use it
     session_id:  used as the MemorySaver thread key for multi-turn memory
     steps:       how many LLM calls have been made (safety counter)
@@ -85,26 +70,42 @@ class AgentState(TypedDict):
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 2: Tool Definitions
 # ══════════════════════════════════════════════════════════════════════════════
-# @tool decorator: converts a Python function into a LangChain tool
-# The docstring becomes the tool's description sent to the LLM
-# The function signature becomes the tool's parameter schema (auto-generated)
-
-# NOTE: ToolNode requires synchronous tools when used with invoke().
-# We call the async RegistryClient via asyncio.run() inside each tool.
-# In production you would use an async-native graph; this is clean enough for portfolio.
-
-import asyncio
 
 # A module-level RegistryClient instance shared across tool calls.
-# This avoids creating a new HTTP client for every tool call.
 _registry = RegistryClient()
 
+
+# ── Upgrade 1: RAG tool ───────────────────────────────────────────────────────
+
+@tool
+def retrieve_plan_context(query: str) -> str:
+    """
+    Search the telecom plan catalogue using semantic similarity.
+    Call this FIRST with the customer question as the query.
+    Returns the most relevant plan descriptions as context.
+    Use this context to ground your recommendation — do not guess plan details.
+    """
+    # rag.retrieve(): loads ChromaDB, embeds the query, returns top-3 similar plans
+    # The returned string is injected directly into the LLM context window
+    try:
+        context = rag.retrieve(query)
+        logger.info("RAG retrieved %d chars of context for query: %s",
+                    len(context), query[:50])
+        return context
+    except RuntimeError as e:
+        # ChromaDB not seeded yet: return helpful error instead of crashing
+        # Agent will fall back to get_all_plans() based on system prompt
+        logger.error("RAG retrieval failed: %s", e)
+        return f"Plan catalogue unavailable: {e}. Falling back to get_all_plans()."
+
+
+# ── Existing tools (unchanged) ────────────────────────────────────────────────
 
 @tool
 def get_subscribed_plans(customer_id: int) -> str:
     """
     Get the list of service plans a customer is currently subscribed to.
-    Call this first to understand what plans the customer already has.
+    Call this to understand what plans the customer already has.
     Returns a JSON string of plan objects with id, name, description, monthlyFeeCents.
     """
     try:
@@ -119,8 +120,7 @@ def get_subscribed_plans(customer_id: int) -> str:
 def get_all_plans() -> str:
     """
     Get all available service plans in the telecom catalogue.
-    Use this after get_subscribed_plans to find plans the customer does NOT have yet,
-    so you can make relevant upgrade or add-on recommendations.
+    Use this to find plans the customer does NOT have yet.
     Returns a JSON string of all plan objects.
     """
     try:
@@ -152,12 +152,12 @@ def get_subscription_details(customer_id: int) -> str:
         return json.dumps({"error": str(e)})
 
 
-# All tools collected in a list — passed to both the model and ToolNode
-TOOLS = [get_subscribed_plans, get_all_plans, get_subscription_details]
+# retrieve_plan_context listed FIRST — LLM sees it as the preferred entry point
+TOOLS = [retrieve_plan_context, get_subscribed_plans, get_all_plans, get_subscription_details]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3: Observability Helper (Week 2)
+# SECTION 3: Observability Helper (Week 2 — unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _record_metrics(
@@ -170,12 +170,6 @@ def _record_metrics(
 ) -> None:
     """
     Write one row to the ai_call_log table in MySQL.
-
-    Why MySQL and not just logs:
-      - Logs are ephemeral; DB rows can be queried by the Java /admin/ai-metrics endpoint
-      - Enables token cost tracking, per-customer usage analysis, and alerting
-      - Mirrors production observability patterns (e.g. Datadog APM custom metrics)
-
     Fails silently: observability must never break the main recommendation flow.
     """
     try:
@@ -203,7 +197,6 @@ def _record_metrics(
             session_id, input_tokens, output_tokens, latency_ms,
         )
     except Exception as e:
-        # Fail silently — observability must not crash the main flow
         logger.warning("Failed to record AI metrics: %s", e)
 
 
@@ -213,17 +206,14 @@ def _record_metrics(
 
 def _build_model() -> ChatOpenAI:
     """
-    Construct the ChatOpenAI model with tools bound.
-
-    bind_tools(): attaches tool schemas to the model request payload.
-    When the LLM decides to call a tool, it returns an AIMessage with
-    tool_calls=[...] instead of a plain text response.
+    Construct the ChatOpenAI model with all tools bound.
+    bind_tools(): attaches tool schemas so the LLM can emit tool_calls.
     """
     llm = ChatOpenAI(
         model=settings.openai_model,
         api_key=settings.openai_api_key,
         max_tokens=800,
-        temperature=0,   # 0 = deterministic, better for tool-calling agents
+        temperature=0,
     )
     return llm.bind_tools(TOOLS)
 
@@ -231,18 +221,8 @@ def _build_model() -> ChatOpenAI:
 def call_model(state: AgentState) -> dict:
     """
     Node: call_model
-    ─────────────────
     Sends the current message history to the LLM and appends the response.
-
-    What this node does:
-      1. Reads state["messages"] (the full conversation so far)
-      2. POSTs to OpenAI with tool schemas attached
-      3. Gets back either: a plain text response, or an AIMessage with tool_calls
-      4. Records token usage + latency to MySQL (Week 2 observability)
-      5. Returns updated messages and incremented steps counter
-
-    state["messages"]: list — full conversation history (LangGraph injects this)
-    state["steps"]:    int  — safety counter to prevent infinite loops
+    Records token usage + latency to MySQL on every call.
     """
     model = _build_model()
     t_start = time.time()
@@ -251,13 +231,10 @@ def call_model(state: AgentState) -> dict:
 
     latency_ms = int((time.time() - t_start) * 1000)
 
-    # Extract token usage from the response metadata
-    # response.usage_metadata is a dict: {"input_tokens": N, "output_tokens": M, ...}
     usage = getattr(response, "usage_metadata", {}) or {}
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
 
-    # Week 2: record every LLM call to MySQL
     _record_metrics(
         session_id=state["session_id"],
         customer_id=state["customer_id"],
@@ -273,32 +250,21 @@ def call_model(state: AgentState) -> dict:
     )
 
     return {
-        "messages": [response],          # add_messages reducer will append this
+        "messages": [response],
         "steps": state["steps"] + 1,
     }
 
 
 def should_continue(state: AgentState) -> str:
     """
-    Conditional edge function: decides what happens after call_model.
-
-    LangGraph conditional edges: instead of hardwiring "A → B",
-    you provide a function that returns a string key, and LangGraph
-    routes to the node mapped to that key.
-
-    Logic:
-      - If last message has tool_calls AND we haven't hit MAX_STEPS → "tools"
-      - Otherwise → END (LangGraph's built-in terminal node)
-
-    Returns:
-      "tools" → route to the ToolNode (execute tool calls)
-      END     → route to end of graph (return final state)
+    Conditional edge: decides what happens after call_model.
+    Returns "tools" if the LLM made tool calls, END otherwise.
+    MAX_STEPS = 5 caps OpenAI API costs.
     """
-    MAX_STEPS = 5   # matches original agent behaviour; caps OpenAI API costs
+    MAX_STEPS = 5
 
     last_message = state["messages"][-1]
 
-    # Check if LLM requested tool calls
     has_tool_calls = (
         hasattr(last_message, "tool_calls")
         and last_message.tool_calls
@@ -316,47 +282,28 @@ def should_continue(state: AgentState) -> str:
 
 def _build_graph():
     """
-    Construct and compile the LangGraph StateGraph.
-
     Graph structure:
         [START] → call_model → (conditional) → tools → call_model → ...
                                              ↘ END
-
-    StateGraph(AgentState): declares the state schema for this graph.
-      Every node receives the full state and returns a partial update dict.
-
-    add_node(name, fn): registers a node. fn receives state, returns dict.
-    add_edge(a, b):     hardwires a → b (always).
-    add_conditional_edges(src, fn, mapping): after src, call fn(state)
-      and route to the node whose name matches the return value.
-
-    compile(checkpointer=memory): enables MemorySaver.
-      Each invocation with the same config["configurable"]["thread_id"]
-      resumes from where that thread left off (multi-turn memory).
     """
     builder = StateGraph(AgentState)
 
-    # Register nodes
     builder.add_node("call_model", call_model)
-    builder.add_node("tools", ToolNode(TOOLS))   # ToolNode handles tool_calls automatically
+    builder.add_node("tools", ToolNode(TOOLS))
 
-    # Entry point: always start at call_model
     builder.set_entry_point("call_model")
 
-    # After call_model: conditionally go to tools or end
     builder.add_conditional_edges(
         "call_model",
         should_continue,
         {
-            "tools": "tools",   # if should_continue returns "tools" → go to tools node
-            END: END,           # if should_continue returns END → terminate
+            "tools": "tools",
+            END: END,
         },
     )
 
-    # After tools: always go back to call_model (loop)
     builder.add_edge("tools", "call_model")
 
-    # Compile with MemorySaver: persists state between invocations per thread_id
     return builder.compile(checkpointer=memory)
 
 
@@ -372,22 +319,20 @@ class TelecomAdvisorAgent:
     """
     Public interface — called by main.py FastAPI route.
     Wraps the LangGraph graph invocation to match the original API contract.
-
-    session_id: if not provided, defaults to "customer-{customer_id}"
-                In a real system this would be a UUID from the frontend session.
     """
 
     async def run(self, request: AdvisorRequest, session_id: Optional[str] = None) -> AdvisorResponse:
         sid = session_id or f"customer-{request.customerId}"
 
+        # Upgrade 1: updated system prompt — instructs agent to use RAG tool first
         system_prompt = (
             "You are a helpful telecom service advisor. "
-            "Your goal is to recommend the best service plans for a customer "
-            "based on their current subscriptions and needs. "
-            "Always call get_subscribed_plans first to see what the customer already has, "
-            "then call get_all_plans to find available options they don't have yet. "
-            "Be specific, concise, and mention monthly pricing where relevant. "
-            "End your response with a 'Recommended plans:' section listing plan names."
+            "To make recommendations, follow this order: "
+            "1. Call retrieve_plan_context(query) with the customer question to get relevant plan context. "
+            "2. Call get_subscribed_plans(customer_id) to see what plans they already have. "
+            "3. Based on the retrieved context and current subscriptions, give a personalised recommendation. "
+            "Always mention monthly pricing. "
+            "End your response with a 'Recommended plans:' section listing plan names with dashes."
         )
 
         user_message = (
@@ -395,7 +340,6 @@ class TelecomAdvisorAgent:
             f"Question: {request.question}"
         )
 
-        # Initial state for this invocation
         initial_state: AgentState = {
             "messages": [
                 SystemMessage(content=system_prompt),
@@ -406,12 +350,9 @@ class TelecomAdvisorAgent:
             "steps": 0,
         }
 
-        # config: LangGraph uses thread_id to look up saved memory for this session
         config = {"configurable": {"thread_id": sid}}
 
         try:
-            # graph.invoke() runs the full graph synchronously
-            # Returns the final state after the graph reaches END
             final_state: AgentState = graph.invoke(initial_state, config=config)
         except Exception as e:
             logger.error("LangGraph agent failed: %s", e, exc_info=True)
@@ -423,7 +364,6 @@ class TelecomAdvisorAgent:
                 agent_steps=0,
             )
 
-        # Extract the last AIMessage (the final LLM response)
         last_message = final_state["messages"][-1]
         advice_text = getattr(last_message, "content", "") or "No recommendation generated."
         steps_taken = final_state.get("steps", 0)
@@ -440,7 +380,6 @@ class TelecomAdvisorAgent:
 def _parse_recommended_plans(advice_text: str) -> list[str]:
     """
     Extract plan names listed after 'Recommended plans:' in the LLM output.
-    Unchanged from original — same contract.
     """
     lines = advice_text.splitlines()
     plans, capturing = [], False
